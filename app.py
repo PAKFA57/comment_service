@@ -12,6 +12,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from image_analyzer import analyze_image_sentiment
 from sklearn.metrics import classification_report
+import re
+import requests
+from bs4 import BeautifulSoup
+from youtube_comment_downloader import YoutubeCommentDownloader
 
 MODEL_PATH = "models/modernBERT"
 
@@ -249,7 +253,10 @@ st.write("Выберите источник текста для анализа:"
 # Подключаем стили
 st.markdown("""<style> /* Весь CSS, как у вас — тот же */ </style>""", unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["💬 Текст", "📁 Файл", "🖼️ Изображение", "🔗 URL", "📑 CSV-таблица"])
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "💬 Текст", "📁 Файл", "🖼️ Изображение", "🔗 URL", "📑 CSV-таблица",
+    "🎥 YouTube комментарии", "📝 VK комментарии"
+])
 
 with tab1:
     user_input = st.text_area("Введите текст для анализа", height=150)
@@ -342,7 +349,6 @@ with tab5:
             df = pd.read_csv(uploaded_file, sep=None, engine="python")
 
             if "text" in df.columns and "label" in df.columns:
-                # Преобразование русских меток к англ. для соответствия model.config.id2label
                 label_map = {
                     "негативный": "negative", "нейтральный": "neutral", "позитивный": "positive",
                     "negative": "negative", "neutral": "neutral", "positive": "positive"
@@ -361,13 +367,11 @@ with tab5:
                     y_true = df["label"].tolist()
                     y_pred = predict_sentiments_batch(texts)
 
-                    # Вывод отчета о классификации
                     report = classification_report(y_true, y_pred, zero_division=0, output_dict=True)
                     report_df = pd.DataFrame(report).transpose()
                     st.subheader("📊 Классификационный отчёт:")
                     st.dataframe(report_df.round(3))
 
-                    # Визуализация распределения предсказанных меток
                     st.subheader("📈 Распределение предсказанных тональностей:")
                     pred_counts = pd.Series(y_pred).value_counts().reindex(config.id2label.values(), fill_value=0)
                     fig, ax = plt.subplots()
@@ -379,3 +383,130 @@ with tab5:
                 st.error("CSV-файл должен содержать колонки 'text' и 'label'.")
         except Exception as e:
             st.error(f"Ошибка при обработке CSV: {e}")
+            
+
+# ——————————————————————————————————————————————
+# 1) Вспомогательные функции для YouTube и VK
+# ——————————————————————————————————————————————
+
+def extract_youtube_video_id(url: str) -> str:
+    patterns = [r"(?:v=|\/)([0-9A-Za-z_-]{11})"]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+def get_youtube_comments(video_id, limit=50):
+    from youtube_comment_downloader import YoutubeCommentDownloader
+
+    try:
+        limit = int(limit)
+    except ValueError:
+        return ["[Ошибка: limit должен быть числом]"]
+
+    downloader = YoutubeCommentDownloader()
+    comments = []
+    try:
+        # Передаём sort_by=1 для сортировки по топу
+        for comment in downloader.get_comments_from_url(
+            f"https://www.youtube.com/watch?v={video_id}", sort_by=1
+        ):
+            text = comment.get("text", "")
+            if isinstance(text, str) and text.strip():
+                comments.append(text.strip())
+                if len(comments) >= limit:
+                    break
+    except Exception as e:
+        comments.append(f"[Ошибка YouTube: {e}]")
+    return comments
+
+def get_vk_post_comments(vk_url, limit=50):
+    try:
+        limit = int(limit)
+    except ValueError:
+        return ["[Ошибка: limit должен быть числом]"]
+    resp = requests.get(vk_url, headers={"User-Agent": "Mozilla/5.0"})
+    soup = BeautifulSoup(resp.text, "html.parser")
+    blocks = soup.find_all("div", class_="wall_reply_text")
+    comments = [b.get_text(strip=True) for b in blocks]
+    return comments[:limit] if comments else ["[Не найдено комментариев или пост закрыт]"]
+
+# ——————————————————————————————————————————————
+# 2) Вкладки YouTube (tab6) и VK (tab7)
+# ——————————————————————————————————————————————
+
+with tab6:
+    st.header("🎥 Анализ комментариев YouTube")
+    yt_url = st.text_input(
+        "🔗 Ссылка на видео",
+        placeholder="https://www.youtube.com/watch?v=... или https://youtu.be/..."
+    )
+    
+    max_comments = st.slider(
+        "Сколько комментариев загрузить", min_value=1, max_value=1000, value=100, step=10, key="yt_slider"
+    )
+    
+    if st.button("📥 Загрузить и проанализировать", key="yt_button"):
+        vid = extract_youtube_video_id(yt_url)
+        if not vid:
+            st.warning("Введите корректную ссылку на видео.")
+        else:
+            with st.spinner("🔍 Загружаем комментарии..."):
+                comments = get_youtube_comments(vid, limit=max_comments)
+            
+            if comments:
+                st.success(f"Загружено комментариев: {len(comments)}")
+                st.dataframe(comments, use_container_width=True)
+                
+                with st.spinner("📊 Анализ тональности..."):
+                    labels = predict_sentiments_batch(comments)
+                    df = pd.DataFrame({"Комментарий": comments, "Тональность": labels})
+                    st.dataframe(df, use_container_width=True)
+                    st.bar_chart(df["Тональность"].value_counts())
+            else:
+                st.warning("Не удалось получить комментарии.")
+
+
+with tab7:
+    st.header("📝 Анализ комментариев VK")
+    vk_link = st.text_input("Введите ссылку на пост ВКонтакте")
+
+    max_vk_comments = st.slider(
+        "Сколько комментариев загрузить", min_value=1, max_value=1000, value=100, step=10
+    )
+
+    if st.button("Загрузить и проанализировать комментарии"):
+        if vk_link:
+            try:
+                from vk_api_handler import fetch_vk_comments  # Убедитесь, что модуль доступен
+
+                with st.spinner("📥 Получаем комментарии..."):
+                    comments = fetch_vk_comments(vk_link, max_comments=max_vk_comments)
+
+                if comments:
+                    st.success(f"🔍 Получено комментариев: {len(comments)}")
+                    st.subheader("📄 Пример комментариев:")
+                    st.write(comments[:10])
+
+                    with st.spinner("🤖 Анализируем тональность..."):
+                        preds = predict_sentiments_batch(comments)
+                        df = pd.DataFrame({"Комментарий": comments, "Тональность": preds})
+
+                        st.subheader("📊 Результаты анализа:")
+                        st.dataframe(df)
+
+                        # Гистограмма
+                        st.subheader("📈 Распределение тональности:")
+                        sentiment_counts = df["Тональность"].value_counts()
+                        fig, ax = plt.subplots()
+                        ax.bar(sentiment_counts.index, sentiment_counts.values, color=['red', 'orange', 'green'])
+                        ax.set_xlabel("Тональность")
+                        ax.set_ylabel("Количество")
+                        st.pyplot(fig)
+                else:
+                    st.warning("Не удалось получить комментарии.")
+            except Exception as e:
+                st.error(f"Ошибка при получении или анализе: {e}")
+        else:
+            st.warning("Пожалуйста, введите ссылку на пост ВКонтакте.")
